@@ -207,14 +207,44 @@ template <class T> struct Tracked {
     }
 };
 
-// AGunReceiver from RotationPerShot through RecoveryFactors_Mounted (contiguous; checked at start).
+// AGunReceiver's recoil numbers, gathered field by field (the game update of 2026-11-13 put new fields between
+// them; each field's offset is looked up by name at start).
 struct Recoil {
-    Vec rot, maxRot, loc, maxLoc;   // rotation: X roll, Y pitch (muzzle rise, always up), Z yaw (either way)
-    float recH, recV, recX, recYZ;  // recovery speeds
-    float stab[12];                 // RecoveryFactors one-handed / two-handed / mounted
+    Vec rot, rotL, maxRot, loc, locL, maxLoc;  // rotation: X roll, Y pitch (muzzle rise, always up), Z yaw (either way)
+                                               // rotL/locL: the left-hand overrides (zero where the build has none)
+    float recH, recV, recX, recYZ;             // recovery speeds
+    float stab[12];                            // RecoveryFactors one-handed / two-handed / mounted
 };
-static_assert(sizeof(Recoil) == 0xA0);
-static int s_recoilOffset = -1;
+static_assert(sizeof(Recoil) == 6 * 24 + 16 * 4);  // no padding: compared with memcmp
+struct RecoilField { const char* name; size_t at; int size; bool optional; int offset = -1; };
+static RecoilField s_recoilFields[] = {
+    {"RotationPerShot", offsetof(Recoil, rot), 24, false},
+    {"LeftHandRotationPerShot", offsetof(Recoil, rotL), 24, true},
+    {"MaxRotation", offsetof(Recoil, maxRot), 24, false},
+    {"LocationPerShot", offsetof(Recoil, loc), 24, false},
+    {"LeftHandLocationPerShot", offsetof(Recoil, locL), 24, true},
+    {"MaxLocation", offsetof(Recoil, maxLoc), 24, false},
+    {"HorizontalRotRecoverySpeed", offsetof(Recoil, recH), 4, false},
+    {"VerticalRotRecoverySpeed", offsetof(Recoil, recV), 4, false},
+    {"XLinearRecoverySpeed", offsetof(Recoil, recX), 4, false},
+    {"YZLinearRecoverySpeed", offsetof(Recoil, recYZ), 4, false},
+    {"RecoveryFactors_OneHanded", offsetof(Recoil, stab), 16, false},
+    {"RecoveryFactors_TwoHanded", offsetof(Recoil, stab) + 16, 16, false},
+    {"RecoveryFactors_Mounted", offsetof(Recoil, stab) + 32, 16, false},
+};
+static bool s_recoilOk = false;
+static int s_recoilSpan = 0;  // RotationPerShot up to the end of MaxLocation in the receiver, as the grip script copies it
+
+static Recoil ReadRecoil(Object gun) {
+    Recoil r{};
+    for (auto& f : s_recoilFields)
+        if (f.offset >= 0) std::memcpy((uint8_t*)&r + f.at, (uint8_t*)gun.ptr + f.offset, f.size);
+    return r;
+}
+static void StoreRecoil(Object gun, const Recoil& r) {
+    for (auto& f : s_recoilFields)
+        if (f.offset >= 0) std::memcpy((uint8_t*)gun.ptr + f.offset, (const uint8_t*)&r + f.at, f.size);
+}
 
 struct Smoothing { float lin, ang, min1, min2; };  // GS_Lerp
 
@@ -346,24 +376,22 @@ static void PatchCopy(Object holder, const void* was, const void* now, size_t si
 }
 
 static void WriteRecoil(Object gun, Gun& g) {
-    auto* live = (Recoil*)((uint8_t*)gun.ptr + s_recoilOffset);
-    Recoil before = *live;
+    Recoil before = ReadRecoil(gun);
     Recoil r = g.recoil.Base(before);
     if (s_enabled.Value() && s_recoil.Value()) {
         const Effect& f = g.fx;
-        r.rot.y *= f.kV; r.maxRot.y *= f.kV;
-        r.rot.z *= f.kH; r.maxRot.z *= f.kH;
-        r.rot.x *= f.kRoll; r.maxRot.x *= f.kRoll;
-        r.loc = r.loc * f.kKick; r.maxLoc = r.maxLoc * f.kKick;
+        for (Vec* v : {&r.rot, &r.rotL, &r.maxRot}) { v->y *= f.kV; v->z *= f.kH; v->x *= f.kRoll; }
+        r.loc = r.loc * f.kKick; r.locL = r.locL * f.kKick; r.maxLoc = r.maxLoc * f.kKick;
         r.recH = (float)(r.recH * f.kRecovery); r.recV = (float)(r.recV * f.kRecovery);
         r.recX = (float)(r.recX * f.kRecovery); r.recYZ = (float)(r.recYZ * f.kRecovery);
     }
-    *live = r;
+    std::vector<uint8_t> was((uint8_t*)gun.ptr + s_recoilFields[0].offset, (uint8_t*)gun.ptr + s_recoilFields[0].offset + s_recoilSpan);
+    StoreRecoil(gun, r);
     g.recoil.written = r;
     if (std::memcmp(&before, &r, sizeof r)) {
         Object gs = gun.GetObj("GSGun");
-        PatchCopy(gs, &before, &r, offsetof(Recoil, recH));             // the four vectors
-        PatchCopy(gs, &before.recH, &r.recH, sizeof(float) * 4);        // and the recovery speeds, if it keeps them
+        PatchCopy(gs, was.data(), (uint8_t*)gun.ptr + s_recoilFields[0].offset, s_recoilSpan);  // the vectors, as laid out in the receiver
+        PatchCopy(gs, &before.recH, &r.recH, sizeof(float) * 4);                                 // and the recovery speeds, if it keeps them
     }
 }
 
@@ -439,7 +467,7 @@ static std::string Describe(Object gun, const Gun& g) {
 static void Apply(Object gun, Gun& g) {
     g.fx = Work(gun, g);
     g.velocity = s_enabled.Value() && s_velocity.Value() ? g.fx.kVelocity : 1;
-    if (s_recoilOffset >= 0) WriteRecoil(gun, g);
+    if (s_recoilOk) WriteRecoil(gun, g);
     WriteSound(gun, g);
     WritePrecision(gun, g);
     WriteHandling(gun, g);
@@ -452,9 +480,10 @@ static void Check(Object gun) {
     Gun& g = s_guns[gun.ptr];
     auto sig = Signature(gun);
     bool changed = sig != g.sig;
-    if (!changed && s_recoilOffset >= 0 && g.recoil.init &&
-        std::memcmp((uint8_t*)gun.ptr + s_recoilOffset, &g.recoil.written, sizeof(Recoil)))
-        changed = true;
+    if (!changed && s_recoilOk && g.recoil.init) {
+        Recoil now = ReadRecoil(gun);
+        if (std::memcmp(&now, &g.recoil.written, sizeof(Recoil))) changed = true;
+    }
     if (!changed && g.loud.init && gun.Get<float>("WeaponFireNoiseLoudness") != g.loud.written) changed = true;
     if (!changed && g.spread.init && gun.Get<float>("WeaponSpread") != g.spread.written) changed = true;
     if (!changed) return;
@@ -816,13 +845,18 @@ GML_AWAKE() {
     LoadTables();
 
     GUClass* receiver = FindClass("GunReceiver");
-    GFProperty* first = receiver ? API->FindProperty((GUStruct*)receiver, "RotationPerShot") : nullptr;
-    GFProperty* last = receiver ? API->FindProperty((GUStruct*)receiver, "RecoveryFactors_Mounted") : nullptr;
-    GML_PropInfo fi{}, li{};
-    if (first && last && API->GetPropertyInfo(first, &fi) && API->GetPropertyInfo(last, &li) &&
-        li.offset + li.size - fi.offset == (int)sizeof(Recoil))
-        s_recoilOffset = fi.offset;
-    else Warn("the gun's recoil numbers aren't laid out as expected (game updated?) - recoil is left alone");
+    s_recoilOk = receiver != nullptr;
+    for (auto& f : s_recoilFields) {
+        GFProperty* p = receiver ? API->FindProperty((GUStruct*)receiver, f.name) : nullptr;
+        GML_PropInfo i{};
+        if (p && API->GetPropertyInfo(p, &i) && i.size == f.size) f.offset = i.offset;
+        else if (!f.optional) s_recoilOk = false;
+    }
+    if (s_recoilOk) s_recoilSpan = s_recoilFields[5].offset + 24 - s_recoilFields[0].offset;  // MaxLocation's end
+    if (!s_recoilOk || s_recoilSpan <= 0) {
+        s_recoilOk = false;
+        Warn("the gun's recoil numbers aren't laid out as expected (game updated?) - recoil is left alone");
+    }
     GML_PropInfo vi{};
     if (GFProperty* vp = API->FindProperty((GUStruct*)FindClass("EBBullet"), "Velocity"); vp && API->GetPropertyInfo(vp, &vi))
         s_velocityOffset = vi.offset;
