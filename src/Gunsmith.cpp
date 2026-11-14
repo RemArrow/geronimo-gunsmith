@@ -30,7 +30,7 @@
 
 using namespace gml;
 
-#define GUNSMITH_VERSION "0.1.0"
+#define GUNSMITH_VERSION "0.1.1"
 GML_PLUGIN("com.remarrow.gunsmith", "Gunsmith", GUNSMITH_VERSION);
 
 struct Vec { double x, y, z; };
